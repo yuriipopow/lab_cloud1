@@ -1,9 +1,9 @@
 # Лабораторна робота 1: Розгортання застосунку в AWS
 
 ## Публічна адреса застосунку
-* **Base URL:** `http://lab-cloud-alb-1619046838.eu-north-1.elb.amazonaws.com`
-* **Swagger UI:** `http://lab-cloud-alb-1619046838.eu-north-1.elb.amazonaws.com/docs`
-* **Health Check:** `http://lab-cloud-alb-1619046838.eu-north-1.elb.amazonaws.com/health`
+* **Base URL:** `http://lab-cloud-alb-1758655395.eu-north-1.elb.amazonaws.com`
+* **Swagger UI:** `http://lab-cloud-alb-1758655395.eu-north-1.elb.amazonaws.com/docs`
+* **Health Check:** `http://lab-cloud-alb-1758655395.eu-north-1.elb.amazonaws.com/health`
 
 ---
 
