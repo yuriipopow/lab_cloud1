@@ -16,4 +16,11 @@ resource "aws_db_instance" "postgres" {
   vpc_security_group_ids = [aws_security_group.db_sg.id]
   publicly_accessible    = false
   skip_final_snapshot    = true
+  storage_encrypted      = true
+
+  # Щоденні автоматичні бекапи + point-in-time recovery (вікно 1 день — у межах Free Tier).
+  # Multi-AZ вимкнено свідомо: подвоює вартість, для навчального стенда не потрібен.
+  backup_retention_period  = 1
+  multi_az                 = false
+  delete_automated_backups = true
 }

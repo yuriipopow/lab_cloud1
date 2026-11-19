@@ -1,5 +1,15 @@
 resource "aws_ecs_cluster" "main" {
   name = "${var.project_name}-cluster"
+
+  # Лог-група Container Insights має існувати до кластера, інакше AWS створить
+  # її сам і вона залишиться після terraform destroy.
+  depends_on = [time_sleep.container_insights_drain]
+
+  # Потрібно для метрик RunningTaskCount / DesiredTaskCount у ECS/ContainerInsights
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
 }
 
 resource "aws_iam_role" "ecs_execution_role" {
@@ -20,6 +30,35 @@ resource "aws_iam_role_policy_attachment" "ecs_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
+# ---------- Секрети: SSM Parameter Store (SecureString, шифрування KMS) ----------
+# Значення приходять з terraform.tfvars (у .gitignore). У task definition потрапляє
+# лише ARN параметра; ECS agent розшифровує його ролю виконання при старті контейнера.
+resource "aws_ssm_parameter" "db_password" {
+  name  = "/${var.project_name}/db_password"
+  type  = "SecureString"
+  value = var.db_password
+}
+
+resource "aws_ssm_parameter" "jwt_secret" {
+  name  = "/${var.project_name}/jwt_secret"
+  type  = "SecureString"
+  value = var.jwt_secret
+}
+
+# Найменші привілеї: роль виконання читає лише ці два параметри
+resource "aws_iam_role_policy" "ecs_execution_ssm" {
+  name = "${var.project_name}-read-app-secrets"
+  role = aws_iam_role.ecs_execution_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:GetParameters"]
+      Resource = [aws_ssm_parameter.db_password.arn, aws_ssm_parameter.jwt_secret.arn]
+    }]
+  })
+}
+
 resource "aws_ecs_task_definition" "app" {
   family                   = "${var.project_name}-task"
   network_mode             = "awsvpc"
@@ -30,20 +69,28 @@ resource "aws_ecs_task_definition" "app" {
 
   container_definitions = jsonencode([{
     name      = "api"
-    image     = "${aws_ecr_repository.app.repository_url}:latest"
+    image     = "${aws_ecr_repository.app.repository_url}:${var.image_tag}"
     essential = true
     portMappings = [{
       containerPort = 3000
       hostPort      = 3000
     }]
+    # Скільки ECS чекає після SIGTERM до SIGKILL (graceful shutdown)
+    stopTimeout = 30
     environment = [
       { name = "PORT", value = "3000" },
       { name = "DB_HOST", value = aws_db_instance.postgres.address },
       { name = "DB_PORT", value = "5432" },
       { name = "DB_NAME", value = "appdb" },
       { name = "DB_USER", value = "dbadmin" },
-      { name = "DB_PASSWORD", value = var.db_password },
-      { name = "JWT_SECRET", value = "prod-jwt-secret-token" }
+      { name = "DB_SSL", value = "true" },
+      { name = "CACHE_ENABLED", value = tostring(var.cache_enabled) },
+      { name = "CACHE_TTL_SECONDS", value = tostring(var.cache_ttl_seconds) },
+      { name = "REDIS_URL", value = "redis://${aws_service_discovery_service.redis.name}.${aws_service_discovery_private_dns_namespace.main.name}:6379" }
+    ]
+    secrets = [
+      { name = "DB_PASSWORD", valueFrom = aws_ssm_parameter.db_password.arn },
+      { name = "JWT_SECRET", valueFrom = aws_ssm_parameter.jwt_secret.arn }
     ]
     logConfiguration = {
       logDriver = "awslogs"
@@ -60,8 +107,11 @@ resource "aws_ecs_service" "main" {
   name            = "${var.project_name}-service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.app.arn
-  desired_count   = 1
+  desired_count   = var.min_tasks
   launch_type     = "FARGATE"
+
+  # Новий екземпляр не вважається «поганим», поки застосунок стартує
+  health_check_grace_period_seconds = 30
 
   network_configuration {
     subnets          = [aws_subnet.public_1.id, aws_subnet.public_2.id]
@@ -73,6 +123,12 @@ resource "aws_ecs_service" "main" {
     target_group_arn = aws_lb_target_group.app.arn
     container_name   = "api"
     container_port   = 3000
+  }
+
+  # desired_count керує Application Auto Scaling; без цього кожен terraform apply
+  # скидав би кількість екземплярів назад до min_tasks.
+  lifecycle {
+    ignore_changes = [desired_count]
   }
 
   depends_on = [aws_lb_listener.http]

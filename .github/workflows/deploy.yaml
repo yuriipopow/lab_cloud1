@@ -2,36 +2,66 @@ name: Deploy to Amazon ECS
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
+    paths:
+      - "app/**"
+      - ".github/workflows/deploy.yaml"
+  workflow_dispatch:
+
+# id-token: write — дозволяє job отримати OIDC-токен від GitHub
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: lab-cloud-repo
+  ECS_CLUSTER: lab-cloud-cluster
+  ECS_SERVICE: lab-cloud-service
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure AWS Credentials
+      # Основний шлях: OIDC → AssumeRoleWithWebIdentity (змінна репозиторію AWS_ROLE_ARN
+      # = terraform output github_deploy_role_arn). Ключі в GitHub не зберігаються.
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ vars.AWS_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Запасний шлях (use_github_oidc = false у Terraform), якщо SCP забороняє OIDC
+      - name: Configure AWS credentials (access key fallback)
+        if: ${{ vars.AWS_ROLE_ARN == '' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: eu-north-1
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image to Amazon ECR
+      # Тег = хеш коміту (незмінна версія для відкату) + latest (на нього посилається task definition)
+      - name: Build, tag and push image
         env:
-          ECR_REGISTRY: 863063109242.dkr.ecr.eu-north-1.amazonaws.com
-          ECR_REPOSITORY: lab-cloud-repo
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build --platform linux/amd64 -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest ./app
+          docker build --platform linux/amd64 \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest ./app
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-      - name: Deploy to ECS Service
+      - name: Deploy to ECS service
         run: |
-          aws ecs update-service --cluster lab-cloud-cluster --service lab-cloud-service --force-new-deployment --region eu-north-1
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment > /dev/null
+          aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE

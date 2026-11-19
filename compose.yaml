@@ -5,11 +5,26 @@ services:
     environment:
       POSTGRES_DB: appdb
       POSTGRES_USER: appuser
-      POSTGRES_PASSWORD: secretlocalpassword
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Скопіюйте .env.example у .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    # Порт бази назовні не публікується: застосунок звертається до неї
+    # всередині мережі compose за іменем сервісу db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   api:
     build:
@@ -22,12 +37,20 @@ services:
       DB_PORT: 5432
       DB_NAME: appdb
       DB_USER: appuser
-      DB_PASSWORD: secretlocalpassword
-      JWT_SECRET: local-jwt-secret
+      DB_PASSWORD: ${DB_PASSWORD:?}
+      JWT_SECRET: ${JWT_SECRET:?}
+      CACHE_ENABLED: "${CACHE_ENABLED:-true}"
+      CACHE_TTL_SECONDS: 30
+      REDIS_URL: redis://redis:6379
     ports:
       - "3000:3000"
+    # depends_on сам лише впорядковує старт; condition: service_healthy
+    # змушує чекати, доки база справді приймає з'єднання
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   pgdata:

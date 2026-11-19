@@ -1,25 +1,29 @@
-# Окремий користувач виключно для деплою з GitHub Actions
-resource "aws_iam_user" "github_deployer" {
-  name = "${var.project_name}-github-deployer"
-}
+# Доступ GitHub Actions до AWS через OIDC (без довговічних ключів).
+#
+# Як це працює: GitHub видає workflow короткоживучий JWT (OIDC-токен) з полями
+# iss = token.actions.githubusercontent.com, aud = sts.amazonaws.com,
+# sub = repo:<owner>/<repo>:ref:refs/heads/main. Workflow обмінює його в STS
+# (AssumeRoleWithWebIdentity) на тимчасові ключі ролі github_deploy (~1 год).
+# Trust policy ролі пускає лише токени з нашого репозиторію і гілки main.
+#
+# use_github_oidc = false — запасний варіант на випадок, якщо SCP організації
+# забороняє створювати OIDC-провайдер: окремий IAM-користувач з access key.
 
-resource "aws_iam_access_key" "github_deployer_key" {
-  user = aws_iam_user.github_deployer.name
-}
+data "aws_caller_identity" "current" {}
 
-resource "aws_iam_user_policy" "github_deployer_policy" {
-  name = "${var.project_name}-deploy-policy"
-  user = aws_iam_user.github_deployer.name
-
-  policy = jsonencode({
+locals {
+  # Мінімальні права для деплою: push у один репозиторій ECR і перезапуск одного сервісу.
+  deploy_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
+        Sid      = "EcrLogin"
         Effect   = "Allow"
         Action   = ["ecr:GetAuthorizationToken"]
         Resource = "*"
       },
       {
+        Sid    = "EcrPush"
         Effect = "Allow"
         Action = [
           "ecr:BatchCheckLayerAvailability",
@@ -33,13 +37,65 @@ resource "aws_iam_user_policy" "github_deployer_policy" {
         Resource = aws_ecr_repository.app.arn
       },
       {
+        Sid      = "EcsDeploy"
         Effect   = "Allow"
-        Action   = [
-          "ecs:UpdateService",
-          "ecs:DescribeServices"
-        ]
+        Action   = ["ecs:UpdateService", "ecs:DescribeServices"]
         Resource = aws_ecs_service.main.id
       }
     ]
   })
+}
+
+# ---------- Варіант 1 (основний): OIDC + роль ----------
+resource "aws_iam_openid_connect_provider" "github" {
+  count          = var.use_github_oidc ? 1 : 0
+  url            = "https://token.actions.githubusercontent.com"
+  client_id_list = ["sts.amazonaws.com"]
+}
+
+resource "aws_iam_role" "github_deploy" {
+  count = var.use_github_oidc ? 1 : 0
+  name  = "${var.project_name}-github-deploy"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = aws_iam_openid_connect_provider.github[0].arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "repo:${var.github_repo}:ref:refs/heads/main"
+        }
+      }
+    }]
+  })
+
+  max_session_duration = 3600
+}
+
+resource "aws_iam_role_policy" "github_deploy" {
+  count  = var.use_github_oidc ? 1 : 0
+  name   = "${var.project_name}-deploy-policy"
+  role   = aws_iam_role.github_deploy[0].id
+  policy = local.deploy_policy
+}
+
+# ---------- Варіант 2 (запасний): IAM-користувач з ключем ----------
+resource "aws_iam_user" "github_deployer" {
+  count = var.use_github_oidc ? 0 : 1
+  name  = "${var.project_name}-github-deployer"
+}
+
+resource "aws_iam_access_key" "github_deployer_key" {
+  count = var.use_github_oidc ? 0 : 1
+  user  = aws_iam_user.github_deployer[0].name
+}
+
+resource "aws_iam_user_policy" "github_deployer_policy" {
+  count  = var.use_github_oidc ? 0 : 1
+  name   = "${var.project_name}-deploy-policy"
+  user   = aws_iam_user.github_deployer[0].name
+  policy = local.deploy_policy
 }

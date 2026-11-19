@@ -4,3 +4,9 @@ terraform/.terraform/
 terraform/*.tfstate
 terraform/*.tfstate.*
 terraform/terraform.tfvars
+*.tfstate
+*.tfstate.*
+.DS_Store
+loadtest/results/local-*
+terraform/bootstrap/.terraform/
+terraform/bootstrap/terraform.tfvars
