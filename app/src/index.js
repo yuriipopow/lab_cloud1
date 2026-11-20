@@ -1,8 +1,12 @@
+const crypto = require('crypto');
 const express = require('express');
-const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const swaggerUi = require('swagger-ui-express');
-const { createClient } = require('redis');
+const { SendMessageCommand } = require('@aws-sdk/client-sqs');
+const {
+  stats, pool, dbQuery, db, initDb, insertNote,
+  redis, redisReady, sqs, getQueueUrl, JOB_TTL_SECONDS, jobKey,
+} = require('./lib');
 
 const app = express();
 app.use(express.json());
@@ -16,89 +20,51 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-fallback-secret';
 const CACHE_ENABLED = process.env.CACHE_ENABLED === 'true';
 const CACHE_TTL_SECONDS = parseInt(process.env.CACHE_TTL_SECONDS || '30', 10);
 const NOTES_LIST_KEY = 'notes:list:v1';
+const cacheOn = () => CACHE_ENABLED && redisReady();
 
-let redis = null;
-if (CACHE_ENABLED && process.env.REDIS_URL) {
-  redis = createClient({
-    url: process.env.REDIS_URL,
-    socket: { connectTimeout: 2000, reconnectStrategy: (n) => Math.min(n * 200, 2000) },
-  });
-  redis.on('error', (err) => console.error('Redis error:', err.message));
-  redis.connect().then(() => console.log('Redis connected')).catch(() => {});
-}
+// ---------- Запис через чергу (лаб. 2, бонус 6) ----------
+// WRITE_MODE=sync  — POST /api/notes пише в БД і відповідає 201 з записом;
+// WRITE_MODE=queue — кладе повідомлення в SQS і відповідає 202 зі статусом задачі.
+const WRITE_MODE = process.env.WRITE_MODE === 'queue' ? 'queue' : 'sync';
 
-// Лічильники для docs/CACHE.md: влучання/промахи кешу і кількість запитів до БД
-// з цього екземпляра. Окремо дублюються в журнал раз на хвилину,
-// щоб можна було сумувати по всіх екземплярах через CloudWatch Logs Insights.
-const stats = { cacheHits: 0, cacheMisses: 0, dbQueries: 0 };
+// ---------- Ідемпотентність (лаб. 2, бонус 7) ----------
+const IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60;
+const idemKey = (key) => `idem:${key}`;
 
-async function dbQuery(text, params) {
-  stats.dbQueries++;
-  return pool.query(text, params);
-}
-
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT || 5432,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  max: parseInt(process.env.DB_POOL_SIZE || '10', 10),
-  // RDS PostgreSQL 15+ за замовчуванням вимагає TLS (rds.force_ssl = 1).
-  // Перевіряємо сертифікат сервера кореневим CA Amazon RDS, вбудованим в образ.
-  ssl: process.env.DB_SSL === 'true'
-    ? { ca: require('fs').readFileSync(process.env.DB_SSL_CA || '/opt/certs/rds-global-bundle.pem', 'utf8') }
-    : false,
-});
-
-// Повторні спроби: БД може ще стартувати, а кілька екземплярів можуть
-// одночасно виконувати CREATE TABLE IF NOT EXISTS (гонка в каталозі PostgreSQL).
-let dbReady = false;
-
-async function initDb(attempt = 1) {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS authors (
-        id SERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        bio TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE TABLE IF NOT EXISTS notes (
-        id SERIAL PRIMARY KEY,
-        content TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-      ALTER TABLE notes ADD COLUMN IF NOT EXISTS author_id INTEGER REFERENCES authors(id);
-      INSERT INTO authors (id, name, bio)
-        SELECT g, 'Автор ' || g, 'Тестовий автор #' || g FROM generate_series(1, 10) g
-        ON CONFLICT (id) DO NOTHING;
-      SELECT setval('authors_id_seq', GREATEST((SELECT MAX(id) FROM authors), 1));
-    `);
-    dbReady = true;
-    console.log('Database initialized');
-  } catch (err) {
-    console.error(`Database init error (attempt ${attempt}):`, err.message);
-    if (attempt < 10) setTimeout(() => initDb(attempt + 1), 3000);
-  }
-}
 initDb();
 
 const swaggerDocument = {
   openapi: '3.0.0',
-  info: { title: 'Cloud Lab API', version: '2.0.0' },
+  info: { title: 'Cloud Lab API', version: '3.0.0' },
   paths: {
     '/health': { get: { summary: 'Health check', responses: { 200: { description: 'OK' } } } },
     '/api/auth/token': { post: { summary: 'Отримати тестовий JWT', responses: { 200: { description: 'Токен' } } } },
     '/api/notes': {
       get: { summary: 'Останні 20 записів (кешується, якщо CACHE_ENABLED=true)', responses: { 200: { description: 'Список' } } },
       post: {
-        summary: 'Створити запис (потрібен JWT)',
+        summary: 'Створити запис (потрібен JWT). WRITE_MODE=queue — асинхронно через SQS',
         security: [{ bearerAuth: [] }],
+        parameters: [{
+          name: 'Idempotency-Key', in: 'header', required: false, schema: { type: 'string', maxLength: 255 },
+          description: 'Повторний запит з тим самим ключем протягом 24 год повертає збережену відповідь без повторного виконання',
+        }],
         requestBody: {
           content: { 'application/json': { schema: { type: 'object', properties: { content: { type: 'string' }, author_id: { type: 'integer' } } } } },
         },
-        responses: { 201: { description: 'Створено' }, 401: { description: 'Неавторизовано' } },
+        responses: {
+          201: { description: 'Створено (WRITE_MODE=sync)' },
+          202: { description: 'Прийнято в обробку (WRITE_MODE=queue); статус — у statusUrl' },
+          401: { description: 'Неавторизовано' },
+          409: { description: 'Запит із цим Idempotency-Key ще виконується' },
+          422: { description: 'Idempotency-Key уже використано з іншим тілом запиту' },
+        },
+      },
+    },
+    '/api/requests/{requestId}': {
+      get: {
+        summary: 'Статус асинхронного запису: pending | done (з noteId)',
+        parameters: [{ name: 'requestId', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: { 200: { description: 'Статус' }, 404: { description: 'Невідомий requestId' } },
       },
     },
     '/api/notes/{id}': {
@@ -129,7 +95,7 @@ app.get('/health', (req, res) => {
   // Під час завершення роботи повертаємо 503, щоб ALB швидше перестав слати сюди трафік.
   if (shuttingDown) return res.status(503).json({ status: 'shutting-down' });
   // Поки таблиці не створені, екземпляр не готовий: ALB не надсилатиме сюди трафік
-  if (!dbReady) return res.status(503).json({ status: 'starting' });
+  if (!db.ready) return res.status(503).json({ status: 'starting' });
   res.status(200).json({ status: 'ok', uptime: process.uptime() });
 });
 
@@ -159,7 +125,7 @@ const NOTES_LIST_SQL = `
 // кладемо в кеш з TTL і віддаємо. Якщо Redis недоступний — працюємо напряму з БД.
 app.get('/api/notes', async (req, res) => {
   try {
-    if (redis && redis.isReady) {
+    if (cacheOn()) {
       try {
         const cached = await redis.get(NOTES_LIST_KEY);
         if (cached) {
@@ -176,7 +142,7 @@ app.get('/api/notes', async (req, res) => {
     const { rows } = await dbQuery(NOTES_LIST_SQL);
     const body = JSON.stringify(rows);
 
-    if (redis && redis.isReady) {
+    if (cacheOn()) {
       redis.set(NOTES_LIST_KEY, body, { EX: CACHE_TTL_SECONDS }).catch((e) => console.error('Redis SET failed:', e.message));
       res.set('X-Cache', 'MISS');
     }
@@ -191,7 +157,8 @@ app.get('/api/notes/:id', async (req, res) => {
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid id' });
   try {
     const { rows } = await dbQuery(
-      `SELECT n.*, a.name AS author_name FROM notes n LEFT JOIN authors a ON a.id = n.author_id WHERE n.id = $1;`,
+      `SELECT n.id, n.content, n.created_at, n.author_id, a.name AS author_name
+       FROM notes n LEFT JOIN authors a ON a.id = n.author_id WHERE n.id = $1;`,
       [id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Not found' });
@@ -217,46 +184,124 @@ app.get('/api/authors/:id', async (req, res) => {
   }
 });
 
-app.post('/api/notes', authenticateToken, async (req, res) => {
+// ---------- Ідемпотентність запису ----------
+// Перший запит із ключем: атомарно (SET NX) займаємо ключ станом "processing",
+// виконуємо операцію і зберігаємо {статус, тіло} на 24 год.
+// Повтор із тим самим ключем і тим самим тілом -> та сама відповідь без повторного виконання
+// (заголовок Idempotent-Replayed: true). Інше тіло -> 422. Ще виконується -> 409.
+function idempotency(req, res, next) {
+  const key = req.get('Idempotency-Key');
+  if (!key) return next();
+  if (key.length > 255) return res.status(400).json({ error: 'Idempotency-Key too long' });
+  if (!redisReady()) return res.status(503).json({ error: 'Idempotency store unavailable, retry later' });
+
+  const fingerprint = crypto.createHash('sha256').update(JSON.stringify(req.body || {})).digest('hex');
+  const rkey = idemKey(key);
+
+  (async () => {
+    // "processing" живе 60 с: якщо екземпляр впаде посеред запиту, ключ звільниться сам,
+    // і клієнт зможе повторити. Готова відповідь зберігається на 24 год.
+    const claimed = await redis.set(rkey, JSON.stringify({ state: 'processing', fingerprint }), {
+      NX: true, EX: 60,
+    });
+    if (!claimed) {
+      stats.idemReplays = (stats.idemReplays || 0) + 1;
+      const saved = JSON.parse((await redis.get(rkey)) || '{}');
+      if (saved.fingerprint && saved.fingerprint !== fingerprint) {
+        return res.status(422).json({ error: 'Idempotency-Key was already used with a different request body' });
+      }
+      if (saved.state !== 'done') {
+        return res.set('Retry-After', '1').status(409).json({ error: 'A request with this Idempotency-Key is still in progress' });
+      }
+      return res.set('Idempotent-Replayed', 'true').status(saved.status).json(saved.body);
+    }
+
+    // Перехоплюємо відповідь обробника, щоб зберегти її під ключем
+    const originalJson = res.json.bind(res);
+    res.json = (body) => {
+      if (res.statusCode < 500) {
+        redis.set(rkey, JSON.stringify({ state: 'done', fingerprint, status: res.statusCode, body }), {
+          EX: IDEMPOTENCY_TTL_SECONDS,
+        }).catch((e) => console.error('Idempotency save failed:', e.message));
+      } else {
+        // Помилка сервера: звільняємо ключ, щоб клієнт міг повторити запит
+        redis.del(rkey).catch(() => {});
+      }
+      return originalJson(body);
+    };
+    req.idempotencyKey = key;
+    next();
+  })().catch((err) => res.status(500).json({ error: err.message }));
+}
+
+app.post('/api/notes', authenticateToken, idempotency, async (req, res) => {
   try {
     const { content, author_id } = req.body || {};
     const authorId = Number.isInteger(author_id) ? author_id : 1;
-    const { rows } = await dbQuery(
-      'INSERT INTO notes (content, author_id) VALUES ($1, $2) RETURNING *;',
-      [content || 'Новий запис', authorId]
-    );
+
+    if (WRITE_MODE === 'queue') {
+      // Асинхронно: кладемо повідомлення в чергу, обробник виконає запис.
+      // requestId стає idempotency_key рядка в БД — повторна доставка того самого
+      // повідомлення (at-least-once) не створить дубль.
+      const requestId = crypto.randomUUID();
+      if (redisReady()) {
+        await redis.set(jobKey(requestId), JSON.stringify({ status: 'pending', acceptedAt: Date.now() }), { EX: JOB_TTL_SECONDS });
+      }
+      await sqs.send(new SendMessageCommand({
+        QueueUrl: await getQueueUrl(),
+        MessageBody: JSON.stringify({ requestId, content, authorId, acceptedAt: Date.now() }),
+      }));
+      stats.enqueued = (stats.enqueued || 0) + 1;
+      const statusUrl = `/api/requests/${requestId}`;
+      return res.status(202).location(statusUrl).json({ requestId, status: 'pending', statusUrl });
+    }
+
+    const { note } = await insertNote({ content, authorId, idempotencyKey: req.idempotencyKey || null });
     // Навмисно НЕ інвалідуємо кеш списку: застарілість обмежена TTL
     // (див. docs/CACHE.md). Щоб вмикати інвалідацію — CACHE_INVALIDATE_ON_WRITE=true.
-    if (redis && redis.isReady && process.env.CACHE_INVALIDATE_ON_WRITE === 'true') {
+    if (redisReady() && process.env.CACHE_INVALIDATE_ON_WRITE === 'true') {
       redis.del(NOTES_LIST_KEY).catch(() => {});
     }
-    res.status(201).json(rows[0]);
+    res.status(201).json(note);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Статус асинхронного запису. Клієнт опитує цей URL з відповіді 202.
+app.get('/api/requests/:requestId', async (req, res) => {
+  try {
+    if (!redisReady()) return res.status(503).json({ error: 'Status store unavailable' });
+    const raw = await redis.get(jobKey(req.params.requestId));
+    if (!raw) return res.status(404).json({ error: 'Unknown requestId' });
+    const job = JSON.parse(raw);
+    if (job.status === 'done') res.set('Location', `/api/notes/${job.noteId}`);
+    res.json({ requestId: req.params.requestId, ...job });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 app.get('/api/stats', (req, res) => {
-  res.json({ cacheEnabled: CACHE_ENABLED, cacheTtl: CACHE_TTL_SECONDS, redisReady: !!(redis && redis.isReady), ...stats });
+  res.json({ writeMode: WRITE_MODE, cacheEnabled: CACHE_ENABLED, cacheTtl: CACHE_TTL_SECONDS, redisReady: redisReady(), ...stats });
 });
 
 // Раз на хвилину пишемо лічильники в журнал у вигляді JSON-рядка,
 // щоб у CloudWatch Logs Insights порахувати сумарну частку влучань по всіх екземплярах.
 let lastStats = { ...stats };
 setInterval(() => {
-  const delta = {
-    cacheHits: stats.cacheHits - lastStats.cacheHits,
-    cacheMisses: stats.cacheMisses - lastStats.cacheMisses,
-    dbQueries: stats.dbQueries - lastStats.dbQueries,
-  };
+  const delta = {};
+  for (const k of ['cacheHits', 'cacheMisses', 'dbQueries', 'enqueued', 'idemReplays']) {
+    delta[k] = (stats[k] || 0) - (lastStats[k] || 0);
+  }
   lastStats = { ...stats };
-  if (delta.cacheHits || delta.cacheMisses || delta.dbQueries) {
-    console.log(JSON.stringify({ type: 'stats', cacheEnabled: CACHE_ENABLED, ...delta }));
+  if (Object.values(delta).some(Boolean)) {
+    console.log(JSON.stringify({ type: 'stats', cacheEnabled: CACHE_ENABLED, writeMode: WRITE_MODE, ...delta }));
   }
 }, 60000).unref();
 
 const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`Server listening on port ${PORT} (write mode: ${WRITE_MODE})`));
 server.keepAliveTimeout = 65000; // більше за idle timeout ALB (60 с), щоб уникнути 502
 
 // Graceful shutdown: ECS надсилає SIGTERM, чекає stopTimeout і тільки потім SIGKILL.

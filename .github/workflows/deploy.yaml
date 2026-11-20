@@ -18,6 +18,7 @@ env:
   ECR_REPOSITORY: lab-cloud-repo
   ECS_CLUSTER: lab-cloud-cluster
   ECS_SERVICE: lab-cloud-service
+  ECS_WORKER_SERVICE: lab-cloud-worker
 
 jobs:
   deploy:
@@ -63,5 +64,7 @@ jobs:
 
       - name: Deploy to ECS service
         run: |
+          # API і обробник черги — один образ, оновлюємо обидва сервіси
           aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment > /dev/null
-          aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_WORKER_SERVICE --force-new-deployment > /dev/null
+          aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE $ECS_WORKER_SERVICE

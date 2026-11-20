@@ -1,5 +1,5 @@
-# Базовий образ із зафіксованою версією: Node 20.12.2 на Debian 12 (bookworm), slim-варіант
-FROM node:20.12.2-bookworm-slim
+# Базовий образ із зафіксованою версією: Node 22 LTS на Debian 12 (bookworm), slim-варіант
+FROM node:22.23.4-bookworm-slim
 
 ENV NODE_ENV=production
 WORKDIR /usr/src/app

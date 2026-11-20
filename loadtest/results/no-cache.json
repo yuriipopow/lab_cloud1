@@ -1,0 +1,13 @@
+{
+  "base_url": "http://lab-cloud-alb-847085021.eu-north-1.elb.amazonaws.com",
+  "vus": 100,
+  "requests": 125061,
+  "rps": 207.8,
+  "error_rate_pct": 0,
+  "p50_ms": 35.8,
+  "p95_ms": 125.3,
+  "p99_ms": 205.3,
+  "max_ms": 1613.5,
+  "iterations": 12506,
+  "cache_hit_ratio_pct": null
+}

@@ -1,4 +1,6 @@
-# Спільний кеш Redis для всіх екземплярів API (лаб. 2, завдання 5).
+# Спільний Redis для всіх екземплярів API (лаб. 2, завдання 5): кеш списку,
+# а також ключі ідемпотентності і статуси асинхронних задач (бонуси 6–7).
+# volatile-lru: при нестачі пам'яті витісняються лише ключі з TTL (у нас — усі).
 # Замість платного ElastiCache — окремий Fargate-сервіс з образом redis:7-alpine,
 # доступний у VPC за DNS-іменем redis.<project>.local (AWS Cloud Map).
 
@@ -33,7 +35,7 @@ resource "aws_security_group" "redis_sg" {
     from_port       = 6379
     to_port         = 6379
     protocol        = "tcp"
-    security_groups = [aws_security_group.ecs_sg.id]
+    security_groups = [aws_security_group.ecs_sg.id, aws_security_group.worker_sg.id]
   }
 
   egress {
@@ -57,7 +59,7 @@ resource "aws_ecs_task_definition" "redis" {
     # Публічна галерея ECR — без лімітів Docker Hub на завантаження
     image     = "public.ecr.aws/docker/library/redis:7-alpine"
     essential = true
-    command   = ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    command   = ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "volatile-lru"]
     portMappings = [{
       containerPort = 6379
       hostPort      = 6379

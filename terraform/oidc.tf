@@ -11,6 +11,18 @@
 
 data "aws_caller_identity" "current" {}
 
+# Значення claim `sub`, яким довіряє роль (лише гілка main нашого репозиторію).
+# GitHub має два формати: класичний `repo:<owner>/<repo>:...` і незмінний
+# `repo:<owner>@<owner_id>/<repo>@<repo_id>:...` (use_immutable_subject). Незмінний
+# містить числові ID, тому перейменований або перестворений репозиторій з тим самим
+# іменем не отримає доступ. Список у StringEquals означає «будь-яке з значень».
+locals {
+  github_oidc_subjects = compact([
+    "repo:${var.github_repo}:ref:refs/heads/main",
+    var.github_oidc_immutable_repo == "" ? "" : "repo:${var.github_oidc_immutable_repo}:ref:refs/heads/main",
+  ])
+}
+
 locals {
   # Мінімальні права для деплою: push у один репозиторій ECR і перезапуск одного сервісу.
   deploy_policy = jsonencode({
@@ -40,7 +52,7 @@ locals {
         Sid      = "EcsDeploy"
         Effect   = "Allow"
         Action   = ["ecs:UpdateService", "ecs:DescribeServices"]
-        Resource = aws_ecs_service.main.id
+        Resource = [aws_ecs_service.main.id, aws_ecs_service.worker.id]
       }
     ]
   })
@@ -66,7 +78,7 @@ resource "aws_iam_role" "github_deploy" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_repo}:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub" = local.github_oidc_subjects
         }
       }
     }]

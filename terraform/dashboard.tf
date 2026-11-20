@@ -117,10 +117,68 @@ resource "aws_cloudwatch_dashboard" "main" {
           yAxis = { left = { min = 0 } }
         }
       },
+      # ---------- Бонус 6: черга і обробник ----------
+      {
+        type   = "metric"
+        x      = 0
+        y      = 12
+        width  = 8
+        height = 6
+        properties = {
+          title  = "6. Черга: повідомлень і вік найстарішого"
+          region = var.aws_region
+          view   = "timeSeries"
+          period = 60
+          metrics = [
+            ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", aws_sqs_queue.writes.name, { stat = "Maximum", label = "У черзі" }],
+            ["AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", aws_sqs_queue.writes.name, { stat = "Maximum", label = "Вік найстарішого, с", yAxis = "right" }],
+          ]
+          yAxis = { left = { min = 0 }, right = { min = 0 } }
+        }
+      },
+      {
+        type   = "metric"
+        x      = 8
+        y      = 12
+        width  = 8
+        height = 6
+        properties = {
+          title  = "7. Обробники черги (бажана / фактична)"
+          region = var.aws_region
+          view   = "timeSeries"
+          stat   = "Maximum"
+          period = 60
+          metrics = [
+            ["ECS/ContainerInsights", "DesiredTaskCount", "ClusterName", aws_ecs_cluster.main.name, "ServiceName", aws_ecs_service.worker.name, { label = "Desired" }],
+            ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", aws_ecs_cluster.main.name, "ServiceName", aws_ecs_service.worker.name, { label = "Running" }],
+          ]
+          yAxis = { left = { min = 0, max = var.worker_max_tasks + 1 } }
+        }
+      },
+      {
+        type   = "metric"
+        x      = 16
+        y      = 12
+        width  = 8
+        height = 6
+        properties = {
+          title  = "8. Записи через чергу за хвилину: надіслано / оброблено"
+          region = var.aws_region
+          view   = "timeSeries"
+          stat   = "Sum"
+          period = 60
+          metrics = [
+            ["AWS/SQS", "NumberOfMessagesSent", "QueueName", aws_sqs_queue.writes.name, { label = "Надіслано (API)" }],
+            ["AWS/SQS", "NumberOfMessagesDeleted", "QueueName", aws_sqs_queue.writes.name, { label = "Оброблено (обробник)" }],
+            ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", aws_sqs_queue.writes_dlq.name, { stat = "Maximum", label = "У DLQ" }],
+          ]
+          yAxis = { left = { min = 0 } }
+        }
+      },
       {
         type   = "alarm"
         x      = 0
-        y      = 12
+        y      = 18
         width  = 24
         height = 2
         properties = {

@@ -59,6 +59,20 @@ resource "aws_iam_role_policy" "ecs_execution_ssm" {
   })
 }
 
+# Змінні середовища, спільні для API і обробника черги
+locals {
+  app_common_env = [
+    { name = "DB_HOST", value = aws_db_instance.postgres.address },
+    { name = "DB_PORT", value = "5432" },
+    { name = "DB_NAME", value = "appdb" },
+    { name = "DB_USER", value = "dbadmin" },
+    { name = "DB_SSL", value = "true" },
+    { name = "REDIS_URL", value = "redis://${aws_service_discovery_service.redis.name}.${aws_service_discovery_private_dns_namespace.main.name}:6379" },
+    { name = "AWS_REGION", value = var.aws_region },
+    { name = "SQS_QUEUE_URL", value = aws_sqs_queue.writes.url },
+  ]
+}
+
 resource "aws_ecs_task_definition" "app" {
   family                   = "${var.project_name}-task"
   network_mode             = "awsvpc"
@@ -66,6 +80,9 @@ resource "aws_ecs_task_definition" "app" {
   cpu                      = "256"
   memory                   = "512"
   execution_role_arn       = aws_iam_role.ecs_execution_role.arn
+  # Роль самого застосунку (не плутати з execution role, яка тягне образ і секрети):
+  # дає право класти повідомлення в чергу SQS. Ключів у контейнері немає.
+  task_role_arn = aws_iam_role.api_task.arn
 
   container_definitions = jsonencode([{
     name      = "api"
@@ -77,17 +94,13 @@ resource "aws_ecs_task_definition" "app" {
     }]
     # Скільки ECS чекає після SIGTERM до SIGKILL (graceful shutdown)
     stopTimeout = 30
-    environment = [
+    environment = concat(local.app_common_env, [
       { name = "PORT", value = "3000" },
-      { name = "DB_HOST", value = aws_db_instance.postgres.address },
-      { name = "DB_PORT", value = "5432" },
-      { name = "DB_NAME", value = "appdb" },
-      { name = "DB_USER", value = "dbadmin" },
-      { name = "DB_SSL", value = "true" },
       { name = "CACHE_ENABLED", value = tostring(var.cache_enabled) },
       { name = "CACHE_TTL_SECONDS", value = tostring(var.cache_ttl_seconds) },
-      { name = "REDIS_URL", value = "redis://${aws_service_discovery_service.redis.name}.${aws_service_discovery_private_dns_namespace.main.name}:6379" }
-    ]
+      # Бонус 6: sync — запис у БД одразу (201); queue — через SQS (202)
+      { name = "WRITE_MODE", value = var.write_mode },
+    ])
     secrets = [
       { name = "DB_PASSWORD", valueFrom = aws_ssm_parameter.db_password.arn },
       { name = "JWT_SECRET", valueFrom = aws_ssm_parameter.jwt_secret.arn }
